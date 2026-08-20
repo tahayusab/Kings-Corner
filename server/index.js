@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { createGame, joinGame, playerAction } = require('./gameLogic');
+const { encryptData, decryptData } = require('./cryptoUtils');
 
 const app = express();
 app.use(cors());
@@ -23,21 +24,24 @@ function broadcastGameState(roomCode) {
   const game = games[roomCode];
   if (!game) return;
 
-  // We should ideally filter hands here to prevent cheating, 
-  // but for local co-op V1 we can send the full state and let the client hide it.
-  // To be safe, let's filter it per socket.
   io.in(roomCode).fetchSockets().then(sockets => {
-    sockets.forEach(socket => {
+    sockets.forEach(async socket => {
       const sanitizedState = { ...game };
-      // Deep copy players to hide hands of others
       sanitizedState.players = game.players.map(p => {
         if (p.id === socket.id) {
-          return p; // Send full hand to the owner
+          return p;
         } else {
-          return { ...p, hand: [], cardCount: p.hand.length }; // Hide hand from others
+          return { ...p, hand: [], cardCount: p.hand.length };
         }
       });
-      socket.emit('gameState', sanitizedState);
+      
+      try {
+        const jsonStr = JSON.stringify(sanitizedState);
+        const encrypted = await encryptData(jsonStr, roomCode);
+        socket.emit('gameState', { encryptedData: encrypted });
+      } catch (err) {
+        console.error("Failed to encrypt game state broadcast", err);
+      }
     });
   });
 }
@@ -85,22 +89,29 @@ io.on('connection', (socket) => {
      }
   });
 
-  socket.on('action', ({ roomCode, actionType, payload }, callback) => {
+  socket.on('action', async ({ roomCode, encryptedData }, callback) => {
     const game = games[roomCode];
     if (game) {
-      const success = playerAction(game, socket.id, actionType, payload);
-      if (success) {
-        broadcastGameState(roomCode);
-        if (callback) callback({ success: true });
-      } else {
-        if (callback) {
-          // Give a generic helpful message, or specific if we want
-          let msg = "Invalid move.";
-          if (actionType === 'PLAY_CARD' && !game.hasDrawnThisTurn) {
-            msg = "You must draw a card first!";
+      try {
+        const decryptedStr = await decryptData(encryptedData, roomCode);
+        const { actionType, payload } = JSON.parse(decryptedStr);
+        
+        const success = playerAction(game, socket.id, actionType, payload);
+        if (success) {
+          broadcastGameState(roomCode);
+          if (callback) callback({ success: true });
+        } else {
+          if (callback) {
+            let msg = "Invalid move.";
+            if (actionType === 'PLAY_CARD' && !game.hasDrawnThisTurn) {
+              msg = "You must draw a card first!";
+            }
+            callback({ success: false, message: msg });
           }
-          callback({ success: false, message: msg });
         }
+      } catch (err) {
+        console.error("Action decryption failed", err);
+        if (callback) callback({ success: false, message: "Security error." });
       }
     }
   });

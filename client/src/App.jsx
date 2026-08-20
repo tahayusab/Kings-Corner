@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { socket } from './socket';
 import GameBoard from './components/GameBoard';
 import Hand from './components/Hand';
 import Card from './components/Card';
+import { encryptData, decryptData } from './cryptoUtils';
 import './index.css';
 
 const getOpponentCoordsStyle = (index, totalOpponents) => {
@@ -112,19 +113,11 @@ function App() {
     } else {
       if (dragOverPile) {
         if (dragState.type === 'hand-card') {
-          socket.emit('action', { 
-            roomCode: gameState.roomCode, 
-            actionType: 'PLAY_CARD', 
-            payload: { cardIndex: dragState.index, destinationPile: dragOverPile } 
-          }, (res) => {
+          sendAction('PLAY_CARD', { cardIndex: dragState.index, destinationPile: dragOverPile }, (res) => {
             if (!res.success) showToast(res.message);
           });
         } else if (dragState.type === 'board-pile') {
-          socket.emit('action', { 
-            roomCode: gameState.roomCode, 
-            actionType: 'MOVE_PILE', 
-            payload: { sourcePile: dragState.sourcePile, destinationPile: dragOverPile } 
-          }, (res) => {
+          sendAction('MOVE_PILE', { sourcePile: dragState.sourcePile, destinationPile: dragOverPile }, (res) => {
             if (!res.success) showToast(res.message);
           });
         }
@@ -145,6 +138,21 @@ function App() {
     return null;
   };
 
+  const currentRoomCodeRef = useRef(null);
+  const pendingDecryptionRef = useRef(null);
+
+  const sendAction = async (actionType, payload, callback) => {
+    if (!gameState) return;
+    const roomCode = gameState.roomCode;
+    try {
+      const jsonStr = JSON.stringify({ actionType, payload });
+      const encrypted = await encryptData(jsonStr, roomCode);
+      socket.emit('action', { roomCode, encryptedData: encrypted }, callback);
+    } catch (err) {
+      console.error("Encryption failed", err);
+    }
+  };
+
   const showToast = (msg) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(''), 3000);
@@ -155,7 +163,22 @@ function App() {
       console.log('Connected to server');
     });
 
-    socket.on('gameState', (state) => {
+    socket.on('gameState', async (data) => {
+      let state = data;
+      if (data.encryptedData) {
+        const roomCode = currentRoomCodeRef.current || roomCodeInput;
+        if (!roomCode) {
+          pendingDecryptionRef.current = data.encryptedData;
+          return;
+        }
+        try {
+          const decryptedStr = await decryptData(data.encryptedData, roomCode);
+          state = JSON.parse(decryptedStr);
+        } catch (err) {
+          console.error("Failed to decrypt game state", err);
+          return;
+        }
+      }
       setGameState(state);
       setSelectedCardIndex(null);
       setSelectedPile(null);
@@ -169,15 +192,41 @@ function App() {
 
   const handleCreateRoom = () => {
     if (!playerName) return showToast('Enter a name');
-    socket.emit('createRoom', playerName, (res) => {
-      if (!res.success) showToast(res.message);
+    socket.emit('createRoom', playerName, async (res) => {
+      if (res.success) {
+        currentRoomCodeRef.current = res.roomCode;
+        if (pendingDecryptionRef.current) {
+          try {
+            const decryptedStr = await decryptData(pendingDecryptionRef.current, res.roomCode);
+            setGameState(JSON.parse(decryptedStr));
+            pendingDecryptionRef.current = null;
+          } catch (err) {
+            console.error("Failed to decrypt pending state", err);
+          }
+        }
+      } else {
+        showToast(res.message);
+      }
     });
   };
 
   const handleJoinRoom = () => {
     if (!playerName || !roomCodeInput) return showToast('Enter name and room code');
-    socket.emit('joinRoom', { roomCode: roomCodeInput, playerName }, (res) => {
-      if (!res.success) showToast(res.message);
+    socket.emit('joinRoom', { roomCode: roomCodeInput, playerName }, async (res) => {
+      if (res.success) {
+        currentRoomCodeRef.current = res.roomCode;
+        if (pendingDecryptionRef.current) {
+          try {
+            const decryptedStr = await decryptData(pendingDecryptionRef.current, res.roomCode);
+            setGameState(JSON.parse(decryptedStr));
+            pendingDecryptionRef.current = null;
+          } catch (err) {
+            console.error("Failed to decrypt pending state", err);
+          }
+        }
+      } else {
+        showToast(res.message);
+      }
     });
   };
 
@@ -189,7 +238,7 @@ function App() {
 
   const handleDraw = () => {
     if (gameState) {
-      socket.emit('action', { roomCode: gameState.roomCode, actionType: 'DRAW_CARD' }, (res) => {
+      sendAction('DRAW_CARD', null, (res) => {
         if (!res.success) showToast(res.message);
       });
     }
@@ -197,7 +246,7 @@ function App() {
 
   const handleEndTurn = () => {
     if (gameState) {
-      socket.emit('action', { roomCode: gameState.roomCode, actionType: 'END_TURN' }, (res) => {
+      sendAction('END_TURN', null, (res) => {
         if (!res.success) showToast(res.message);
       });
     }
@@ -214,11 +263,7 @@ function App() {
 
   const handlePilePress = (pileName) => {
     if (selectedCardIndex !== null) {
-      socket.emit('action', { 
-        roomCode: gameState.roomCode, 
-        actionType: 'PLAY_CARD', 
-        payload: { cardIndex: selectedCardIndex, destinationPile: pileName } 
-      }, (res) => {
+      sendAction('PLAY_CARD', { cardIndex: selectedCardIndex, destinationPile: pileName }, (res) => {
         if (!res.success) showToast(res.message);
       });
       // Optionally deselect after attempting to play (whether success or fail)
@@ -228,11 +273,7 @@ function App() {
     } else if (selectedPile === null) {
       setSelectedPile(pileName);
     } else {
-      socket.emit('action', { 
-        roomCode: gameState.roomCode, 
-        actionType: 'MOVE_PILE', 
-        payload: { sourcePile: selectedPile, destinationPile: pileName } 
-      }, (res) => {
+      sendAction('MOVE_PILE', { sourcePile: selectedPile, destinationPile: pileName }, (res) => {
         if (!res.success) showToast(res.message);
       });
       // Deselect after moving pile
